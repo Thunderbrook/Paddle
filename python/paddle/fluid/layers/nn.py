@@ -122,6 +122,7 @@ __all__ = [
     'resize_trilinear',
     'resize_nearest',
     'gather',
+    'gather_nd',
     'scatter',
     'sequence_scatter',
     'random_crop',
@@ -184,6 +185,7 @@ __all__ = [
     'space_to_depth',
     'affine_grid',
     'sequence_reverse',
+    'sequence_topk_avg_pooling',
     'affine_channel',
     'similarity_focus',
     'hash',
@@ -512,6 +514,54 @@ def embedding(input,
             'padding_idx': padding_idx
         })
     return tmp
+
+
+def _pull_box_sparse(input, size, dtype='float32'):
+    """
+    **Pull Box Sparse Layer**
+
+    This layer is used to lookup embeddings of IDs, provided by :attr:`input`, in
+    BoxPS lookup table. The result of this lookup is the embedding of each ID in the
+    :attr:`input`.
+
+    Args:
+        input(Variable|list of Variable): Input is a Tensor<int64> Variable, which 
+            contains the IDs information.
+        size(int): The embedding size parameter, which indicates the size of 
+            each embedding vector respectively.
+        dtype(str): The dtype refers to the data type of output tensor. Only supports 
+	    float32 now.
+
+    Returns:
+        Variable|list of Variable: The tensor variable storing the embeddings of the \
+                  supplied inputs.
+
+    Examples:
+        .. code-block:: python
+
+          import paddle.fluid as fluid
+          data = fluid.layers.data(name='sequence', shape=[1], dtype='int64', lod_level=1)
+          emb = fluid.layers.pull_box_sparse(input=data, size=[11])    
+    """
+    helper = LayerHelper('pull_box_sparse', **locals())
+    if dtype != 'float32':
+        raise ValueError(
+            "BoxPS only support float type embedding now, and your type is: " +
+            dtype)
+    helper.input_dtype()
+    inputs = helper.multiple_input()
+    outs = [
+        helper.create_variable_for_type_inference(dtype)
+        for i in range(len(inputs))
+    ]
+    helper.append_op(
+        type='pull_box_sparse',
+        inputs={'Ids': inputs},
+        outputs={'Out': outs},
+        attrs={'size': size})
+    if len(outs) == 1:
+        return outs[0]
+    return outs
 
 
 @templatedoc(op_type="lstm")
@@ -1354,7 +1404,7 @@ def gru_unit(input,
 
 
 @templatedoc()
-def linear_chain_crf(input, label, param_attr=None):
+def linear_chain_crf(input, label, param_attr=None, length=None):
     """
     Linear Chain CRF.
 
@@ -1364,6 +1414,7 @@ def linear_chain_crf(input, label, param_attr=None):
         input(${emission_type}): ${emission_comment}
         input(${transition_type}): ${transition_comment}
         label(${label_type}): ${label_comment}
+        Length(${length_type}): ${length_comment}
         param_attr(ParamAttr): The attribute of the learnable parameter.
 
     Returns:
@@ -1374,16 +1425,62 @@ def linear_chain_crf(input, label, param_attr=None):
     Examples:
         .. code-block:: python
 
-             import paddle.fluid as fluid
-             emission = fluid.layers.data(name='emission', shape=[1000], dtype='float32')
-             target = fluid.layers.data(name='target', shape=[1], dtype='int32')
-             crf_cost = fluid.layers.linear_chain_crf(
-                 input=emission,
-                 label=target,
-                 param_attr=fluid.ParamAttr(
-                     name='crfw',
-                     learning_rate=0.2))
+            import paddle.fluid as fluid
+            import numpy as np
 
+            #define net structure, using LodTensor
+            train_program = fluid.Program()
+            startup_program = fluid.Program()
+            with fluid.program_guard(train_program, startup_program):
+                input_data = fluid.layers.data(name='input_data', shape=[10], dtype='float32', lod_level=1)
+                label = fluid.layers.data(name='label', shape=[1], dtype='int', lod_level=1)
+                emission= fluid.layers.fc(input=input_data, size=10, act="tanh")
+                crf_cost = fluid.layers.linear_chain_crf(
+                    input=emission,
+                    label=label,
+                    param_attr=fluid.ParamAttr(
+                    name='crfw',
+                    learning_rate=0.01)) 
+            use_cuda = False
+            place = fluid.CUDAPlace(0) if use_cuda else fluid.CPUPlace()
+            exe = fluid.Executor(place)
+            exe.run(startup_program)    
+            #define data, using LoDTensor
+            a = fluid.create_lod_tensor(np.random.rand(12,10).astype('float32'), [[3,3,4,2]], place)
+            b = fluid.create_lod_tensor(np.array([[1],[1],[2],[3],[1],[1],[1],[3],[1],[1],[1],[1]]),[[3,3,4,2]] , place)
+            feed1 = {'input_data':a,'label':b}
+            loss= exe.run(train_program,feed=feed1, fetch_list=[crf_cost])
+            print(loss) 
+
+            #define net structure, using padding
+            train_program = fluid.Program()
+            startup_program = fluid.Program()
+            with fluid.program_guard(train_program, startup_program):
+                input_data2 = fluid.layers.data(name='input_data2', shape=[10,10], dtype='float32')
+                label2 = fluid.layers.data(name='label2', shape=[10,1], dtype='int')
+                label_length = fluid.layers.data(name='length', shape=[1], dtype='int')
+                emission2= fluid.layers.fc(input=input_data2, size=10, act="tanh", num_flatten_dims=2)
+                crf_cost2 = fluid.layers.linear_chain_crf(
+                    input=emission2,
+                    label=label2,
+                    length=label_length,
+                    param_attr=fluid.ParamAttr(
+                     name='crfw',
+                     learning_rate=0.01))
+
+            use_cuda = False
+            place = fluid.CUDAPlace(0) if use_cuda else fluid.CPUPlace()
+            exe = fluid.Executor(place)
+            exe.run(startup_program)
+
+            #define data, using padding
+            cc=np.random.rand(4,10,10).astype('float32')
+            dd=np.random.rand(4,10,1).astype('int64')
+            ll=np.array([[3,3,4,2]])
+            feed2 = {'input_data2':cc,'label2':dd,'length':ll}
+
+            loss2= exe.run(train_program,feed=feed2, fetch_list=[crf_cost2])
+            print(loss2) 
     """
     helper = LayerHelper('linear_chain_crf', **locals())
     size = input.shape[1]
@@ -1399,11 +1496,16 @@ def linear_chain_crf(input, label, param_attr=None):
         dtype=helper.input_dtype())
     log_likelihood = helper.create_variable_for_type_inference(
         dtype=helper.input_dtype())
+    this_inputs = {
+        "Emission": [input],
+        "Transition": transition,
+        "Label": [label]
+    }
+    if length:
+        this_inputs['length'] = [length]
     helper.append_op(
         type='linear_chain_crf',
-        inputs={"Emission": [input],
-                "Transition": transition,
-                "Label": label},
+        inputs=this_inputs,
         outputs={
             "Alpha": [alpha],
             "EmissionExps": [emission_exps],
@@ -1919,22 +2021,70 @@ def sequence_conv(input,
                   num_filters,
                   filter_size=3,
                   filter_stride=1,
-                  padding=None,
+                  padding=True,
+                  padding_start=None,
                   bias_attr=None,
                   param_attr=None,
                   act=None,
                   name=None):
     """
-    This function creates the op for sequence_conv, using the inputs and
-    other convolutional configurations for the filters and stride as given
-    in the input parameters to the function.
+    The sequence_conv receives input sequences with variable length and other convolutional
+    configuration parameters for the filter and stride to apply the convolution operation.
+    It fills all-zero padding data on both sides of the sequence by default to ensure that
+    the output is the same length as the input. You can customize the padding behavior by
+    configuring the parameter :attr:`padding\_start`.
+    
+    **Warning:** the parameter :attr:`padding` take no effect and will be deprecated in the future.
+
+    .. code-block:: text
+
+            Here we'll illustrate the details of the padding operation:
+            For a mini-batch of 2 variable lengths sentences, containing 3, and 1 time-steps:
+            Assumed input (X) is a [4, M, N] float LoDTensor, and X->lod()[0] = [0, 3, 4].
+            Besides, for the sake of simplicity, we assume M=1 and N=2.
+            X = [[a1, a2;
+                  b1, b2;
+                  c1, c2]
+                 [d1, d2]]
+
+            This is to say that input (X) has 4 words and the dimension of each word
+            representation is 2.
+
+            * Case1:
+
+                If padding_start is -1 and filter_size is 3.
+                The length of padding data is calculated as follows:
+                up_pad_len = max(0, -padding_start) = 1
+                down_pad_len = max(0, filter_size + padding_start - 1) = 1
+
+                The output of the input sequence after padding is:
+                data_aftet_padding = [[0,  0,  a1, a2, b1, b2;
+                                       a1, a2, b1, b2, c1, c2;
+                                       b1, b2, c1, c2, 0,  0 ]
+                                      [0,  0,  d1, d2, 0,  0 ]]
+
+                It will be multiplied by the filter weight to get the final output.
 
     Args:
         input (Variable): ${x_comment}
-        num_filters (int): number of filters.
-        filter_size (int): the filter size (H and W).
-        filter_stride (int): stride of the filter.
-        padding (bool): if True, add paddings.
+        num_filters (int): the number of filters.
+        filter_size (int): the height of filter, the width is hidden size by default.
+        filter_stride (int): stride of the filter. Currently only supports :attr:`stride` = 1.
+        padding (bool): the parameter :attr:`padding` take no effect and will be discarded in the
+            future. Currently, it will always pad input to make sure the length of the output is
+            the same as input whether :attr:`padding` is set true or false. Because the length of
+            input sequence may be shorter than :attr:`filter\_size`, which will cause the convolution
+            result to not be computed correctly. These padding data will not be trainable or updated
+            while trainnig. 
+        padding_start (int|None): It is used to indicate the start index for padding the input
+            sequence, which can be negative. The negative number means to pad
+            :attr:`|padding_start|` time-steps of all-zero data at the beginning of each instance.
+            The positive number means to skip :attr:`padding_start` time-steps of each instance,
+            and it will pad :math:`filter\_size + padding\_start - 1` time-steps of all-zero data
+            at the end of the sequence to ensure that the output is the same length as the input.
+            If set None, the same length :math:`\\frac{filter\_size}{2}` of data will be filled
+            on both sides of the sequence. If set 0, the length of :math:`filter\_size - 1` data
+            is padded at the end of each input sequence.
         bias_attr (ParamAttr|bool|None): The parameter attribute for the bias of sequence_conv.
             If it is set to False, no bias will be added to the output units.
             If it is set to None or one attribute of ParamAttr, sequence_conv
@@ -1953,11 +2103,13 @@ def sequence_conv(input,
         Variable: output of sequence_conv
 
     Examples:
+
         .. code-block:: python
 
              import paddle.fluid as fluid
+
              x = fluid.layers.data(name='x', shape=[10,10], append_batch_size=False, dtype='float32')
-             x_conved = fluid.layers.sequence_conv(x,2)
+             x_conved = fluid.layers.sequence_conv(input=x, num_filters=2, filter_size=3, padding_start=-1)
     """
 
     assert not in_dygraph_mode(), (
@@ -1968,6 +2120,8 @@ def sequence_conv(input,
     filter_param = helper.create_parameter(
         attr=helper.param_attr, shape=filter_shape, dtype=dtype)
     pre_bias = helper.create_variable_for_type_inference(dtype)
+    if padding_start is None:
+        padding_start = -int(filter_size // 2)
 
     helper.append_op(
         type='sequence_conv',
@@ -1978,8 +2132,8 @@ def sequence_conv(input,
         outputs={"Out": pre_bias},
         attrs={
             'contextStride': filter_stride,
-            'contextStart': -int(filter_size // 2),
-            'contextLength': filter_size
+            'contextStart': padding_start,
+            'contextLength': filter_size,
         })
     pre_act = helper.append_bias_op(pre_bias)
     return helper.append_activation(pre_act)
@@ -8396,6 +8550,91 @@ def gather(input, index, overwrite=True):
     return out
 
 
+def gather_nd(input, index, name=None):
+    """
+    **Gather Nd Layer**
+
+    This function is actually a high-dimensional extension of :code:`gather` 
+    and supports for simultaneous indexing by multiple axes. :attr:`index` is a 
+    K-dimensional integer tensor, which is regarded as a (K-1)-dimensional 
+    tensor of :attr:`index` into :attr:`input`, where each element defines 
+    a slice of params:
+
+    .. math::
+
+        output[(i_0, ..., i_{K-2})] = input[index[(i_0, ..., i_{K-2})]]
+
+    Obviously, :code:`index.shape[-1] <= input.rank` . And, the output tensor has
+    shape :code:`index.shape[:-1] + input.shape[index.shape[-1]:]` .
+
+    .. code-block:: text
+
+            Given:
+                input = [[[ 0,  1,  2,  3],
+                          [ 4,  5,  6,  7],
+                          [ 8,  9, 10, 11]],
+                         [[12, 13, 14, 15],
+                          [16, 17, 18, 19],
+                          [20, 21, 22, 23]]]
+                input.shape = (2, 3, 4)
+
+            * Case 1:
+                index = [[1]]
+                
+                gather_nd(input, index)  
+                         = [input[1, :, :]] 
+                         = [[12, 13, 14, 15],
+                            [16, 17, 18, 19],
+                            [20, 21, 22, 23]]
+
+            * Case 2:
+                index = [[0,2]]
+
+                gather_nd(input, index)
+                         = [input[0, 2, :]]
+                         = [8, 9, 10, 11]
+
+            * Case 3:
+                index = [[1, 2, 3]]
+
+                gather_nd(input, index)
+                         = [input[1, 2, 3]]
+                         = [23]
+
+    Args:
+        input (Variable): The source input
+        index (Variable): The index input with rank > 1, index.shape[-1] <= input.rank
+        name (str|None): A name for this layer(optional). If set None, the
+                         layer will be named automatically
+
+    Returns:
+        output (Variable): A tensor with the shape index.shape[:-1] + input.shape[index.shape[-1]:]
+
+    Examples:
+
+        .. code-block:: python
+
+            import paddle.fluid as fluid
+            x = fluid.layers.data(name='x', shape=[3, 4, 5], dtype='float32')
+            index = fluid.layers.data(name='index', shape=[2, 2], dtype='int32')
+            output = fluid.layers.gather_nd(x, index)
+
+    """
+    helper = LayerHelper('gather_nd', **locals())
+    dtype = helper.input_dtype()
+    if name is None:
+        output = helper.create_variable_for_type_inference(dtype)
+    else:
+        output = helper.create_variable(
+            name=name, dtype=dtype, persistable=False)
+    helper.append_op(
+        type="gather_nd",
+        inputs={"X": input,
+                "Index": index},
+        outputs={"Out": output})
+    return output
+
+
 def scatter(input, index, updates, name=None, overwrite=True):
     """
     **Scatter Layer**
@@ -8708,10 +8947,12 @@ def mean_iou(input, label, num_classes):
         .. code-block:: python
 
             import paddle.fluid as fluid
-            predict = fluid.layers.data(name='predict', shape=[3, 32, 32])
-            label = fluid.layers.data(name='label', shape=[1])
+            iou_shape = [32, 32]
+            num_classes = 5
+            predict = fluid.layers.data(name='predict', shape=iou_shape)
+            label = fluid.layers.data(name='label', shape=iou_shape)
             iou, wrongs, corrects = fluid.layers.mean_iou(predict, label,
-                                                          num_classes=5)
+                                                          num_classes)
     """
     helper = LayerHelper('mean_iou', **locals())
     dtype = helper.input_dtype()
@@ -11076,6 +11317,73 @@ def sequence_reverse(x, name=None):
         inputs={"X": x},
         outputs={"Y": out},
         attrs=dict())
+    return out
+
+
+def sequence_topk_avg_pooling(input, row, col, topks, channel_num):
+    """
+    The :attr:`topks` is a list with incremental values in this function. For each topk,
+    it will average the topk features as an output feature for each channel of every 
+    input sequence. Both :attr:`row` and :attr:`col` are LodTensor, which provide height 
+    and width information for :attr:`input` tensor. If feature size of input sequence is less 
+    than topk, it will padding 0 at the back.
+
+    .. code-block:: text
+
+            If channel_num is 2 and given row LoDTensor and col LoDTensor as follows:
+                row.lod = [[5, 4]]
+                col.lod = [[6, 7]]
+
+            input is a LoDTensor with input.lod[0][i] = channel_num * row.lod[0][i] * col.lod[0][i] 
+                input.lod = [[60, 56]]  # where 60 = channel_num * 5 * 6
+                input.dims = [116, 1]   # where 116 = 60 + 56
+
+            If topks is [1, 3, 5], then we get a 1-level LoDTensor:
+                out.lod =  [[5, 4]] 	# share Lod info with row LodTensor
+                out.dims = [9, 6]   	# where 6 = len(topks) * channel_num
+
+    Args:
+        input (Variable): The input should be 2D LodTensor with dims[1] equals 1.
+        row (Variable): The row shoud be 1-level LodTensor to provide the height information
+                        of the input tensor data.
+        col (Variable): The col shoud be 1-level LodTensor to provide the width information
+                        of the input tensor data.
+        topks (list): A list of incremental value to average the topk feature.
+        channel_num (int): The number of input channel.
+
+    Returns:
+        Variable: output LodTensor specified by this layer.
+
+    Examples:
+
+        .. code-block:: python
+
+            import numpy as np
+            from paddle.fluid import layers
+
+            x_lod_tensor = layers.data(name='x', shape=[1], lod_level=1)
+            row_lod_tensor = layers.data(name='row', shape=[6], lod_level=1)
+            col_lod_tensor = layers.data(name='col', shape=[6], lod_level=1)
+            out = layers.sequence_topk_avg_pooling(input=x_lod_tensor,
+                                                   row=row_lod_tensor,
+                                                   col=col_lod_tensor,
+                                                   topks=[1, 3, 5],
+                                                   channel_num=5)
+    """
+    helper = LayerHelper('sequence_topk_avg_pooling', **locals())
+    out = helper.create_variable_for_type_inference(dtype=helper.input_dtype())
+    pos = helper.create_variable_for_type_inference(
+        dtype=helper.input_dtype(), stop_gradient=True)
+    helper.append_op(
+        type='sequence_topk_avg_pooling',
+        inputs={'X': input,
+                'ROW': row,
+                'COLUMN': col},
+        outputs={'Out': out,
+                 'pos': pos},
+        attrs={'topks': topks,
+               'channel_num': channel_num})
+
     return out
 
 
