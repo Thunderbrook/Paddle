@@ -360,7 +360,8 @@ int FleetWrapper::RegisterHeterCallback(HeterCallBackFunc handler) {
   VLOG(3) << "calling FleetWrapper::RegisterHeterCallback";
   VLOG(3) << "pslib_ptr_=" << pslib_ptr_;
   VLOG(3) << "_worker_ptr=" << pslib_ptr_->_worker_ptr;
-  return pslib_ptr_->_worker_ptr->registe_heter_callback(handler);
+  //return pslib_ptr_->_worker_ptr->registe_heter_callback(handler);
+  return 0;
 
 #else
   VLOG(0) << "FleetWrapper::RegisterHeterCallback"

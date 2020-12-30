@@ -188,7 +188,7 @@ void HeterComm<KeyType, ValType, GradType>::merge_grad(int gpu_num, KeyType* d_k
   int dev_id = resource_->dev_id(gpu_num);
   platform::CUDAPlace place = platform::CUDAPlace(dev_id);
   platform::CUDADeviceGuard guard(dev_id);
-  auto stream = resource_->stream(gpu_num);
+  auto stream = resource_->local_stream(gpu_num, 0);
 
   size_t temp_storage_bytes;
 
@@ -240,7 +240,7 @@ void HeterComm<KeyType, ValType, GradType>::split_input_to_shard(
   int dev_id = resource_->dev_id(gpu_num);
   platform::CUDAPlace place = platform::CUDAPlace(dev_id);
   platform::CUDADeviceGuard guard(dev_id);
-  auto stream = resource_->stream(gpu_num);
+  auto stream = resource_->local_stream(gpu_num, 0);
 
   auto d_idx_tmp = memory::AllocShared(place, len * sizeof(int));
   int* d_idx_tmp_ptr = reinterpret_cast<int*>(d_idx_tmp->ptr());
@@ -283,7 +283,7 @@ void HeterComm<KeyType, ValType, GradType>::pull_sparse(int num, KeyType* d_keys
   int dev_id = resource_->dev_id(num);
   platform::CUDAPlace place = platform::CUDAPlace(dev_id);
   platform::CUDADeviceGuard guard(dev_id);
-  auto stream = resource_->stream(num);
+  auto stream = resource_->local_stream(num, 0);
 
   int grid_size = (len - 1) / block_size_ + 1;
 
@@ -348,20 +348,23 @@ void HeterComm<KeyType, ValType, GradType>::pull_sparse(int num, KeyType* d_keys
       continue;
     }
     cudaMemcpyAsync(d_remote_shard_keys_ptr[i], d_shard_keys_ptr + h_left[i],
-                    shard_len * sizeof(KeyType), cudaMemcpyDefault, stream);
+                    shard_len * sizeof(KeyType), cudaMemcpyDefault, resource_->local_stream(num, i));
   }
-  cudaStreamSynchronize(stream);
+//  for (int i = 0; i < total_gpu; ++i) {
+//    cudaStreamSynchronize(resource_->local_stream(num, i));
+//  }
 
   for (int i = 0; i < total_gpu; ++i) {
     if (h_left[i] == -1) {
       continue;
     }
+    cudaStreamSynchronize(resource_->local_stream(num, i));
     platform::CUDADeviceGuard guard(resource_->dev_id(i));
     tables_[i]->get(d_remote_shard_keys_ptr[i], d_remote_shard_vals_ptr[i],
-                    h_right[i] - h_left[i] + 1, resource_->stream(i));
+                    h_right[i] - h_left[i] + 1, resource_->remote_stream(i));
   }
   for (int i = 0; i < total_gpu; ++i) {
-    cudaStreamSynchronize(resource_->stream(i));
+    cudaStreamSynchronize(resource_->remote_stream(i));
   }
 
   for (int i = 0; i < total_gpu; ++i) {
@@ -372,11 +375,11 @@ void HeterComm<KeyType, ValType, GradType>::pull_sparse(int num, KeyType* d_keys
     platform::CUDADeviceGuard guard(resource_->dev_id(i));
     cudaMemcpyAsync(d_shard_vals_ptr + h_left[i], d_remote_shard_vals_ptr[i],
                     shard_len * sizeof(ValType), cudaMemcpyDefault,
-                    resource_->stream(i));
+                    resource_->comm_stream(num, i));
   }
 
   for (int i = 0; i < total_gpu; ++i) {
-    cudaStreamSynchronize(resource_->stream(i));
+    cudaStreamSynchronize(resource_->comm_stream(num, i));
   }
 
   fill_dvals<<<grid_size, block_size_, 0, stream>>>(d_shard_vals_ptr, d_vals,
@@ -398,7 +401,7 @@ void HeterComm<KeyType, ValType, GradType>::push_sparse(int gpu_num,
   int dev_id = resource_->dev_id(gpu_num);
   platform::CUDAPlace place = platform::CUDAPlace(dev_id);
   platform::CUDADeviceGuard guard(dev_id);
-  auto stream = resource_->stream(gpu_num);
+  auto stream = resource_->local_stream(gpu_num, 0);
 
   int h_left[total_gpu];
   int h_right[total_gpu];
@@ -469,23 +472,27 @@ void HeterComm<KeyType, ValType, GradType>::push_sparse(int gpu_num,
       continue;
     }
     cudaMemcpyAsync(d_remote_shard_keys_ptr[i], d_shard_keys_ptr + h_left[i],
-                    shard_len * sizeof(KeyType), cudaMemcpyDefault, stream);
+                    shard_len * sizeof(KeyType), cudaMemcpyDefault, resource_->local_stream(gpu_num, i));
     cudaMemcpyAsync(d_remote_shard_grads_ptr[i], d_shard_grads_ptr + h_left[i],
-                    shard_len * sizeof(GradType), cudaMemcpyDefault, stream);
+                    shard_len * sizeof(GradType), cudaMemcpyDefault, resource_->local_stream(gpu_num, i));
   }
-
-  cudaStreamSynchronize(stream);
+  
+//  for (int i = 0; i < total_gpu; ++i) {
+//    cudaStreamSynchronize(resource_->local_stream(gpu_num, i));
+//  }
 
   for (int i = 0; i < total_gpu; ++i) {
     if (h_left[i] == -1 || h_right[i] == -1) {
       continue;
     }
+    cudaStreamSynchronize(resource_->local_stream(gpu_num, i));
+    
     platform::CUDADeviceGuard guard(resource_->dev_id(i));
     tables_[i]->update(d_remote_shard_keys_ptr[i], d_remote_shard_grads_ptr[i],
-                       h_right[i] - h_left[i] + 1, sgd, resource_->stream(i));
+                       h_right[i] - h_left[i] + 1, sgd, resource_->remote_stream(i));
   }
   for (int i = 0; i < total_gpu; ++i) {
-    cudaStreamSynchronize(resource_->stream(i));
+    cudaStreamSynchronize(resource_->remote_stream(i));
   }
 }
 
